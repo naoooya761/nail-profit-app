@@ -35,11 +35,13 @@ DEFAULT_COURSES = [
 ]
 PURCHASE_SOURCES = ["TAT", "SHEIN", "楽天", "Amazon", "100均", "その他"]
 BUYERS = ["阪口", "前山", "その他"]
+DISCOUNT_OPTIONS = list(range(0, 101, 5))
+TAX_RATE = 0.10
 
 HEADERS = {
     "sales": ["id", "登録日時", "日付", "期生", "生徒名", "コース", "支払い方法", "金額"],
     "expenses": ["id", "登録日時", "日付", "商品名", "購入元", "金額", "購入者"],
-    "tool_purchases": ["id", "登録日時", "日付", "商品名", "購入元", "金額", "購入者"],
+    "tool_purchases": ["id", "登録日時", "日付", "商品名", "購入元", "入力区分", "入力金額", "割引率", "割引額", "税抜価格", "消費税", "金額", "購入者"],
     "tool_sales": ["id", "登録日時", "日付", "期生", "名前", "道具代"],
     "settings": ["設定種別", "コース名", "料金"],
 }
@@ -98,6 +100,38 @@ def normalize_id(v):
 
 def sum_amount(records, key):
     return sum(to_int(r.get(key, 0)) for r in records)
+
+
+def calc_tool_purchase(input_mode, input_amount, discount_rate):
+    """道具購入の金額計算。
+    入力金額に割引を反映し、最終的な税込金額を「金額」として扱う。
+    """
+    base = to_int(input_amount)
+    discount_rate = to_int(discount_rate)
+    discount_multiplier = max(0, 100 - discount_rate) / 100
+
+    if input_mode == "税込価格で入力":
+        original_tax_included = base
+        final_tax_included = int(round(original_tax_included * discount_multiplier))
+        final_tax_excluded = int(round(final_tax_included / (1 + TAX_RATE)))
+        tax_amount = final_tax_included - final_tax_excluded
+        discount_amount = original_tax_included - final_tax_included
+    else:
+        original_tax_excluded = base
+        final_tax_excluded = int(round(original_tax_excluded * discount_multiplier))
+        tax_amount = int(round(final_tax_excluded * TAX_RATE))
+        final_tax_included = final_tax_excluded + tax_amount
+        discount_amount = original_tax_excluded - final_tax_excluded
+
+    return {
+        "入力区分": input_mode,
+        "入力金額": base,
+        "割引率": discount_rate,
+        "割引額": discount_amount,
+        "税抜価格": final_tax_excluded,
+        "消費税": tax_amount,
+        "金額": final_tax_included,
+    }
 
 
 def show_table(records, hidden_cols=None):
@@ -366,7 +400,7 @@ def build_pdf(amount_only=False):
     else:
         y = draw_records_detail(c, "① 売上", st.session_state.sales, ["日付", "期生", "生徒名", "コース", "支払い方法", "金額"], y)
         y = draw_records_detail(c, "② 経費", st.session_state.expenses, ["日付", "商品名", "購入元", "金額", "購入者"], y)
-        y = draw_records_detail(c, "③ 道具購入", st.session_state.tool_purchases, ["日付", "商品名", "購入元", "金額", "購入者"], y)
+        y = draw_records_detail(c, "③ 道具購入", st.session_state.tool_purchases, ["日付", "商品名", "購入元", "入力区分", "入力金額", "割引率", "割引額", "税抜価格", "消費税", "金額", "購入者"], y)
         y = draw_records_detail(c, "④ 道具販売", st.session_state.tool_sales, ["日付", "期生", "名前", "道具代"], y)
 
     if y < 260:
@@ -615,21 +649,45 @@ with tab2:
 with tab3:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("③ 道具購入")
+    st.caption("税込価格・税抜価格のどちらでも入力できます。割引率は5%刻みで選択できます。")
     with st.form("purchase_form", clear_on_submit=True):
         c1, c2 = st.columns(2)
         d = c1.date_input("日付", value=date.today(), key="purchase_date")
-        name = c1.text_input("商品名", placeholder="例：ジェル、チップ、筆")
+        name = c1.text_input("商品名", placeholder="例：ジェル、チップ、筆、TATまとめ買い")
         source = c1.selectbox("購入元", PURCHASE_SOURCES, key="purchase_source")
-        price = c2.number_input("金額", min_value=0, step=100, key="purchase_price")
-        buyer = c2.selectbox("購入者", BUYERS, key="purchase_buyer")
+        buyer = c1.selectbox("購入者", BUYERS, key="purchase_buyer")
+
+        input_mode = c2.radio("入力する金額の種類", ["税込価格で入力", "税抜価格で入力"], horizontal=True, key="purchase_input_mode")
+        input_amount = c2.number_input("レシート金額・定価", min_value=0, step=100, key="purchase_input_amount")
+        discount_rate = c2.selectbox("割引率", DISCOUNT_OPTIONS, index=0, format_func=lambda x: f"{x}%", key="purchase_discount_rate")
+        calc = calc_tool_purchase(input_mode, input_amount, discount_rate)
+        m1, m2, m3 = c2.columns(3)
+        m1.metric("税込金額", yen(calc["金額"]))
+        m2.metric("税抜金額", yen(calc["税抜価格"]))
+        m3.metric("消費税", yen(calc["消費税"]))
+        c2.caption(f"割引額：{yen(calc['割引額'])}")
         submit = st.form_submit_button("道具購入を登録する")
     if submit:
         if not name.strip():
             st.error("商品名を入力してください。")
-        elif price <= 0:
+        elif input_amount <= 0:
             st.error("金額を入力してください。")
         else:
-            row = {"id": next_id(st.session_state.tool_purchases), "登録日時": now_text(), "日付": d.strftime("%Y-%m-%d"), "商品名": name.strip(), "購入元": source, "金額": int(price), "購入者": buyer}
+            row = {
+                "id": next_id(st.session_state.tool_purchases),
+                "登録日時": now_text(),
+                "日付": d.strftime("%Y-%m-%d"),
+                "商品名": name.strip(),
+                "購入元": source,
+                "入力区分": calc["入力区分"],
+                "入力金額": calc["入力金額"],
+                "割引率": calc["割引率"],
+                "割引額": calc["割引額"],
+                "税抜価格": calc["税抜価格"],
+                "消費税": calc["消費税"],
+                "金額": calc["金額"],
+                "購入者": buyer,
+            }
             st.session_state.tool_purchases.append(row)
             st.success(save_record("tool_purchases", row))
     st.markdown('</div>', unsafe_allow_html=True)
@@ -652,16 +710,44 @@ with tab3:
             e_date = c1.date_input("日付", value=pd.to_datetime(target.get("日付", date.today())).date(), key="edit_purchase_date")
             e_name = c1.text_input("商品名", value=str(target.get("商品名", "")))
             e_source = c1.selectbox("購入元", PURCHASE_SOURCES, index=PURCHASE_SOURCES.index(target.get("購入元")) if target.get("購入元") in PURCHASE_SOURCES else 0, key="edit_purchase_source")
-            e_price = c2.number_input("金額", min_value=0, step=100, value=to_int(target.get("金額", 0)), key="edit_purchase_price")
-            e_buyer = c2.selectbox("購入者", BUYERS, index=BUYERS.index(target.get("購入者")) if target.get("購入者") in BUYERS else 0, key="edit_purchase_buyer")
+            e_buyer = c1.selectbox("購入者", BUYERS, index=BUYERS.index(target.get("購入者")) if target.get("購入者") in BUYERS else 0, key="edit_purchase_buyer")
+
+            current_mode = str(target.get("入力区分", "税込価格で入力"))
+            if current_mode not in ["税込価格で入力", "税抜価格で入力"]:
+                current_mode = "税込価格で入力"
+            e_input_mode = c2.radio("入力する金額の種類", ["税込価格で入力", "税抜価格で入力"], index=["税込価格で入力", "税抜価格で入力"].index(current_mode), horizontal=True, key="edit_purchase_input_mode")
+            default_input_amount = to_int(target.get("入力金額", target.get("金額", 0)))
+            e_input_amount = c2.number_input("レシート金額・定価", min_value=0, step=100, value=default_input_amount, key="edit_purchase_input_amount")
+            current_discount = to_int(target.get("割引率", 0))
+            if current_discount not in DISCOUNT_OPTIONS:
+                current_discount = 0
+            e_discount_rate = c2.selectbox("割引率", DISCOUNT_OPTIONS, index=DISCOUNT_OPTIONS.index(current_discount), format_func=lambda x: f"{x}%", key="edit_purchase_discount_rate")
+            e_calc = calc_tool_purchase(e_input_mode, e_input_amount, e_discount_rate)
+            m1, m2, m3 = c2.columns(3)
+            m1.metric("税込金額", yen(e_calc["金額"]))
+            m2.metric("税抜金額", yen(e_calc["税抜価格"]))
+            m3.metric("消費税", yen(e_calc["消費税"]))
+            c2.caption(f"割引額：{yen(e_calc['割引額'])}")
             update_btn = st.form_submit_button("道具購入を更新する")
             delete_btn = st.form_submit_button("道具購入を削除する")
         if update_btn:
-            if not e_name.strip() or e_price <= 0:
+            if not e_name.strip() or e_input_amount <= 0:
                 st.error("商品名と金額を入力してください。")
             else:
                 new_row = dict(target)
-                new_row.update({"日付": e_date.strftime("%Y-%m-%d"), "商品名": e_name.strip(), "購入元": e_source, "金額": int(e_price), "購入者": e_buyer})
+                new_row.update({
+                    "日付": e_date.strftime("%Y-%m-%d"),
+                    "商品名": e_name.strip(),
+                    "購入元": e_source,
+                    "入力区分": e_calc["入力区分"],
+                    "入力金額": e_calc["入力金額"],
+                    "割引率": e_calc["割引率"],
+                    "割引額": e_calc["割引額"],
+                    "税抜価格": e_calc["税抜価格"],
+                    "消費税": e_calc["消費税"],
+                    "金額": e_calc["金額"],
+                    "購入者": e_buyer,
+                })
                 st.session_state.tool_purchases[idx] = new_row
                 st.success(update_record("tool_purchases", target.get("id"), new_row))
                 st.rerun()
