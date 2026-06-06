@@ -38,6 +38,21 @@ BUYERS = ["阪口", "前山", "その他"]
 DISCOUNT_OPTIONS = list(range(0, 101, 5))
 TAX_RATE = 0.10
 
+
+PDF_DEFAULT_COLUMNS = {
+    "sales": ["日付", "期生", "生徒名", "コース", "支払い方法", "金額"],
+    "expenses": ["日付", "商品名", "購入元", "金額", "購入者"],
+    "tool_purchases": ["日付", "商品名", "購入元", "入力区分", "入力金額", "割引率", "割引額", "税抜価格", "消費税", "金額", "購入者"],
+    "tool_sales": ["日付", "期生", "名前", "道具代"],
+}
+PDF_AMOUNT_COLUMNS = {
+    "sales": ["日付", "金額"],
+    "expenses": ["日付", "金額"],
+    "tool_purchases": ["日付", "税抜価格", "消費税", "金額"],
+    "tool_sales": ["日付", "道具代"],
+}
+MONEY_COLUMNS = {"金額", "道具代", "入力金額", "割引額", "税抜価格", "消費税", "料金"}
+
 HEADERS = {
     "sales": ["id", "登録日時", "日付", "期生", "生徒名", "コース", "支払い方法", "金額"],
     "expenses": ["id", "登録日時", "日付", "商品名", "購入元", "金額", "購入者"],
@@ -144,6 +159,18 @@ def show_table(records, hidden_cols=None):
         if col in df.columns:
             df = df.drop(columns=[col])
     st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+def show_table_with_total(records, amount_key, total_label, hidden_cols=None):
+    """登録済み表と、その下の合計金額をまとめて表示する。"""
+    show_table(records, hidden_cols=hidden_cols)
+    total = sum_amount(records, amount_key) if records else 0
+    st.markdown(
+        f"<div style='text-align:right;font-weight:800;font-size:1.05rem;color:#56314e;margin-top:.5rem;'>"
+        f"{total_label}：{yen(total)}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
 
 def next_id(records):
@@ -347,92 +374,191 @@ def totals():
 # =========================
 # PDF
 # =========================
-def draw_records_detail(c, title, records, headers, y):
-    c.setFont("HeiseiKakuGo-W5", 12)
-    c.drawString(40, y, title)
-    y -= 18
-    c.setFont("HeiseiKakuGo-W5", 8.5)
+def _pdf_text(text, max_chars=16):
+    text = "" if text is None else str(text)
+    text = text.replace("\n", " ")
+    return text if len(text) <= max_chars else text[: max_chars - 1] + "…"
+
+
+def _draw_report_header(c, title, subtitle=None):
+    c.setFont("HeiseiKakuGo-W5", 16)
+    c.drawString(35, 805, title)
+    c.setFont("HeiseiKakuGo-W5", 9)
+    c.drawString(35, 787, f"作成日時：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    if subtitle:
+        c.drawString(35, 772, subtitle)
+        y = 758
+    else:
+        y = 770
+    c.line(35, y, 560, y)
+    return y - 18
+
+
+def _draw_table_header(c, x, y, columns, widths):
+    c.setFont("HeiseiKakuGo-W5", 8)
+    c.setFillGray(0.92)
+    c.rect(x, y - 16, sum(widths), 16, stroke=1, fill=1)
+    c.setFillGray(0)
+    current_x = x
+    for col, w in zip(columns, widths):
+        c.rect(current_x, y - 16, w, 16, stroke=1, fill=0)
+        c.drawString(current_x + 3, y - 11, _pdf_text(col, max(4, int(w / 6))))
+        current_x += w
+    return y - 16
+
+
+def _draw_table_row(c, x, y, values, widths, font_size=7.2):
+    c.setFont("HeiseiKakuGo-W5", font_size)
+    row_h = 15
+    current_x = x
+    for val, w in zip(values, widths):
+        c.rect(current_x, y - row_h, w, row_h, stroke=1, fill=0)
+        c.drawString(current_x + 3, y - 10.5, _pdf_text(val, max(4, int(w / 5.6))))
+        current_x += w
+    return y - row_h
+
+
+def _format_pdf_value(column, value):
+    if column in MONEY_COLUMNS:
+        return yen(value)
+    if column == "割引率" and str(value) != "":
+        return f"{to_int(value)}%"
+    return value
+
+
+def _auto_widths(columns, total_width=515):
+    if not columns:
+        return []
+    min_w = 38
+    base = max(min_w, int(total_width / len(columns)))
+    widths = [base for _ in columns]
+    diff = total_width - sum(widths)
+    if widths:
+        widths[-1] += diff
+    return widths
+
+
+def _draw_detail_table(c, title, records, columns, widths, y, amount_key=None):
+    x = 35
+    if y < 95:
+        c.showPage()
+        y = _draw_report_header(c, "ネイルスクール利益計算レポート", "①～④ 登録明細")
+    c.setFont("HeiseiKakuGo-W5", 11)
+    c.drawString(x, y, title)
+    y -= 20
     if not records:
-        c.drawString(48, y, "データなし")
-        return y - 22
-    for i, r in enumerate(records, 1):
-        if y < 70:
+        c.setFont("HeiseiKakuGo-W5", 9)
+        c.drawString(x + 8, y, "データなし")
+        return y - 28
+
+    y = _draw_table_header(c, x, y, columns, widths)
+    for r in records:
+        if y < 60:
             c.showPage()
-            c.setFont("HeiseiKakuGo-W5", 8.5)
-            y = 800
-        line = f"{i}. " + " / ".join([f"{h}:{r.get(h, '')}" for h in headers])
-        c.drawString(48, y, line[:105])
-        y -= 15
-    return y - 8
+            y = _draw_report_header(c, "ネイルスクール利益計算レポート", f"{title} 続き")
+            y = _draw_table_header(c, x, y, columns, widths)
+        values = [_format_pdf_value(col, r.get(col, "")) for col in columns]
+        y = _draw_table_row(c, x, y, values, widths)
+
+    if amount_key:
+        if y < 50:
+            c.showPage()
+            y = _draw_report_header(c, "ネイルスクール利益計算レポート", f"{title} 合計")
+        c.setFont("HeiseiKakuGo-W5", 9)
+        c.drawRightString(x + sum(widths), y - 13, f"合計：{yen(sum_amount(records, amount_key))}")
+        y -= 26
+    return y - 6
 
 
-def draw_records_amount_only(c, title, amount_label, total_amount, count, y):
+def _draw_amount_only_table(c, y):
+    t = totals()
+    rows = [
+        ["① 売上", len(st.session_state.sales), yen(t["sales_total"])],
+        ["② 経費", len(st.session_state.expenses), yen(t["expenses_total"])],
+        ["③ 道具購入", len(st.session_state.tool_purchases), yen(t["purchase_total"])],
+        ["④ 道具販売", len(st.session_state.tool_sales), yen(t["tool_sales_total"])],
+    ]
+    columns = ["項目", "件数", "合計金額"]
+    widths = [230, 90, 180]
+    x = 45
+    c.setFont("HeiseiKakuGo-W5", 11)
+    c.drawString(x, y, "①～④ 金額のみ（個人情報非表示）")
+    y -= 20
+    y = _draw_table_header(c, x, y, columns, widths)
+    for row in rows:
+        y = _draw_table_row(c, x, y, row, widths, font_size=8.5)
+    return y - 18
+
+
+def _draw_summary_page(c):
+    t = totals()
+    y = _draw_report_header(c, "ネイルスクール利益計算レポート", "⑤ 集計・利益配分")
+    x = 60
+    rows = [
+        ["売上合計", yen(t["sales_total"])],
+        ["経費合計", yen(t["expenses_total"])],
+        ["売上利益（売上合計－経費合計）", yen(t["school_profit"])],
+        ["道具販売合計", yen(t["tool_sales_total"])],
+        ["道具購入合計", yen(t["purchase_total"])],
+        ["道具利益（道具販売合計－道具購入合計）", yen(t["tool_profit"])],
+        ["総利益（売上利益＋道具利益）", yen(t["total_profit"])],
+    ]
+    columns = ["集計項目", "金額"]
+    widths = [310, 160]
     c.setFont("HeiseiKakuGo-W5", 12)
-    c.drawString(40, y, title)
-    y -= 18
-    c.setFont("HeiseiKakuGo-W5", 10)
-    c.drawString(48, y, f"件数：{count}件")
-    y -= 17
-    c.drawString(48, y, f"{amount_label}：{yen(total_amount)}")
-    return y - 26
+    c.drawString(x, y, "⑤ 集計")
+    y -= 22
+    y = _draw_table_header(c, x, y, columns, widths)
+    for row in rows:
+        y = _draw_table_row(c, x, y, row, widths, font_size=8.5)
+
+    y -= 30
+    c.setFont("HeiseiKakuGo-W5", 12)
+    c.drawString(x, y, "利益配分")
+    y -= 22
+    rows = [
+        ["テナント賃料", "20%", yen(t["tenant"])],
+        ["阪口", "20%", yen(t["sakaguchi"])],
+        ["前山", "60%", yen(t["maeyama"])],
+    ]
+    columns = ["配分先", "割合", "金額"]
+    widths = [220, 90, 160]
+    y = _draw_table_header(c, x, y, columns, widths)
+    for row in rows:
+        y = _draw_table_row(c, x, y, row, widths, font_size=8.5)
 
 
-def build_pdf(amount_only=False):
+def build_pdf(amount_only=False, selected_columns=None):
+    """①～④は表形式、⑤集計は必ず別ページに分けてPDFを作成する。
+    selected_columnsで①～④それぞれPDFに出す列を選択できる。
+    """
     if canvas is None:
         return None
     pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
-    t = totals()
+    selected_columns = selected_columns or PDF_DEFAULT_COLUMNS
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
-    c.setFont("HeiseiKakuGo-W5", 18)
-    c.drawString(40, 805, "ネイルスクール利益計算レポート")
-    c.setFont("HeiseiKakuGo-W5", 10)
-    c.drawString(40, 785, f"作成日時：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    c.drawString(40, 768, f"表示形式：{'金額のみ（個人情報非表示）' if amount_only else '詳細'}")
-    c.line(40, 758, 555, 758)
-    y = 735
 
+    y = _draw_report_header(
+        c,
+        "ネイルスクール利益計算レポート",
+        "①～④ 登録明細" if not amount_only else "①～④ 金額のみ（個人情報非表示）",
+    )
     if amount_only:
-        y = draw_records_amount_only(c, "① 売上", "売上合計", t["sales_total"], len(st.session_state.sales), y)
-        y = draw_records_amount_only(c, "② 経費", "経費合計", t["expenses_total"], len(st.session_state.expenses), y)
-        y = draw_records_amount_only(c, "③ 道具購入", "道具購入合計", t["purchase_total"], len(st.session_state.tool_purchases), y)
-        y = draw_records_amount_only(c, "④ 道具販売", "道具販売合計", t["tool_sales_total"], len(st.session_state.tool_sales), y)
+        _draw_amount_only_table(c, y)
     else:
-        y = draw_records_detail(c, "① 売上", st.session_state.sales, ["日付", "期生", "生徒名", "コース", "支払い方法", "金額"], y)
-        y = draw_records_detail(c, "② 経費", st.session_state.expenses, ["日付", "商品名", "購入元", "金額", "購入者"], y)
-        y = draw_records_detail(c, "③ 道具購入", st.session_state.tool_purchases, ["日付", "商品名", "購入元", "入力区分", "入力金額", "割引率", "割引額", "税抜価格", "消費税", "金額", "購入者"], y)
-        y = draw_records_detail(c, "④ 道具販売", st.session_state.tool_sales, ["日付", "期生", "名前", "道具代"], y)
+        sales_cols = selected_columns.get("sales") or ["金額"]
+        expense_cols = selected_columns.get("expenses") or ["金額"]
+        purchase_cols = selected_columns.get("tool_purchases") or ["金額"]
+        tool_sale_cols = selected_columns.get("tool_sales") or ["道具代"]
 
-    if y < 260:
-        c.showPage()
-        y = 800
-    c.setFont("HeiseiKakuGo-W5", 13)
-    c.drawString(40, y, "⑤ 集計")
-    y -= 22
-    c.setFont("HeiseiKakuGo-W5", 10)
-    lines = [
-        f"売上合計：{yen(t['sales_total'])}",
-        f"経費合計：{yen(t['expenses_total'])}",
-        f"売上利益：売上合計 - 経費合計 = {yen(t['school_profit'])}",
-        "",
-        f"道具販売合計：{yen(t['tool_sales_total'])}",
-        f"道具購入合計：{yen(t['purchase_total'])}",
-        f"道具利益：道具販売合計 - 道具購入合計 = {yen(t['tool_profit'])}",
-        "",
-        f"総利益：売上利益 + 道具利益 = {yen(t['total_profit'])}",
-        "",
-        "利益配分",
-        f"テナント賃料 20%：{yen(t['tenant'])}",
-        f"阪口 20%：{yen(t['sakaguchi'])}",
-        f"前山 60%：{yen(t['maeyama'])}",
-    ]
-    for line in lines:
-        if y < 50:
-            c.showPage()
-            c.setFont("HeiseiKakuGo-W5", 10)
-            y = 800
-        c.drawString(48, y, line)
-        y -= 17
+        y = _draw_detail_table(c, "① 売上", st.session_state.sales, sales_cols, _auto_widths(sales_cols), y, "金額")
+        y = _draw_detail_table(c, "② 経費", st.session_state.expenses, expense_cols, _auto_widths(expense_cols), y, "金額")
+        y = _draw_detail_table(c, "③ 道具購入", st.session_state.tool_purchases, purchase_cols, _auto_widths(purchase_cols), y, "金額")
+        y = _draw_detail_table(c, "④ 道具販売", st.session_state.tool_sales, tool_sale_cols, _auto_widths(tool_sale_cols), y, "道具代")
+
+    c.showPage()
+    _draw_summary_page(c)
     c.save()
     buf.seek(0)
     return buf.getvalue()
@@ -539,7 +665,7 @@ with tab1:
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("**登録済み売上**")
-    show_table(st.session_state.sales, hidden_cols=["id"])
+    show_table_with_total(st.session_state.sales, "金額", "売上合計", hidden_cols=["id"])
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -607,7 +733,7 @@ with tab2:
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("**登録済み経費**")
-    show_table(st.session_state.expenses, hidden_cols=["id"])
+    show_table_with_total(st.session_state.expenses, "金額", "経費合計", hidden_cols=["id"])
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -694,7 +820,7 @@ with tab3:
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("**登録済み道具購入**")
-    show_table(st.session_state.tool_purchases, hidden_cols=["id"])
+    show_table_with_total(st.session_state.tool_purchases, "金額", "道具購入合計", hidden_cols=["id"])
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -786,7 +912,7 @@ with tab4:
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("**登録済み道具販売**")
-    show_table(st.session_state.tool_sales, hidden_cols=["id"])
+    show_table_with_total(st.session_state.tool_sales, "道具代", "道具販売合計", hidden_cols=["id"])
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -856,9 +982,23 @@ with tab5:
         "PDFの表示内容",
         ["詳細を表示", "金額のみ（個人情報非表示）"],
         horizontal=True,
-        help="テナントの方へ共有する場合は、金額のみを選ぶと氏名・商品名などをPDFに出しません。",
+        help="テナントの方へ共有する場合は、金額のみを選ぶと氏名・商品名などをPDFに出しません。詳細表示では、PDFに出す列を選択できます。",
     )
     amount_only = pdf_mode == "金額のみ（個人情報非表示）"
+
+    selected_pdf_columns = PDF_AMOUNT_COLUMNS.copy() if amount_only else PDF_DEFAULT_COLUMNS.copy()
+    if not amount_only:
+        with st.expander("PDFに表示する項目を選択", expanded=True):
+            st.caption("チェックした項目だけがPDFの①～④の表に反映されます。氏名や商品名を外すと、個人情報を隠したPDFにできます。")
+            col_a, col_b = st.columns(2)
+            selected_pdf_columns = {
+                "sales": col_a.multiselect("① 売上に表示する項目", PDF_DEFAULT_COLUMNS["sales"], default=PDF_DEFAULT_COLUMNS["sales"]),
+                "expenses": col_b.multiselect("② 経費に表示する項目", PDF_DEFAULT_COLUMNS["expenses"], default=PDF_DEFAULT_COLUMNS["expenses"]),
+                "tool_purchases": col_a.multiselect("③ 道具購入に表示する項目", PDF_DEFAULT_COLUMNS["tool_purchases"], default=PDF_DEFAULT_COLUMNS["tool_purchases"]),
+                "tool_sales": col_b.multiselect("④ 道具販売に表示する項目", PDF_DEFAULT_COLUMNS["tool_sales"], default=PDF_DEFAULT_COLUMNS["tool_sales"]),
+            }
+            if any(len(v) == 0 for v in selected_pdf_columns.values()):
+                st.warning("項目が0個の表は、PDFでは金額項目だけを表示します。")
     b1, b2, b3 = st.columns(3)
     if b1.button("スプレッドシートから再読込", key="reload2"):
         load_all()
@@ -870,11 +1010,11 @@ with tab5:
         st.session_state.tool_purchases = []
         st.session_state.tool_sales = []
         st.success("画面上の入力をクリアしました。スプレッドシートのデータは削除されません。")
-    pdf_data = build_pdf(amount_only=amount_only)
+    pdf_data = build_pdf(amount_only=amount_only, selected_columns=selected_pdf_columns)
     if pdf_data:
         suffix = "amount_only" if amount_only else "detail"
         b3.download_button(
-            "レポートをダウンロード",
+            "レポートをダウンロード（①～④と⑤を別ページ）",
             data=pdf_data,
             file_name=f"nail_profit_report_{suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
             mime="application/pdf",
